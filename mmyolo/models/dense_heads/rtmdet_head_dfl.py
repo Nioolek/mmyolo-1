@@ -181,6 +181,7 @@ class RTMDetSepBNHeadModuleDFL(BaseModule):
 
         cls_scores = []
         bbox_preds = []
+        bbox_dist_preds_list = []
         for idx, x in enumerate(feats):
             cls_feat = x
             reg_feat = x
@@ -206,9 +207,13 @@ class RTMDetSepBNHeadModuleDFL(BaseModule):
                 self.proj.view([-1, 1])).squeeze(-1) * self.dfl_scale
             bbox_preds_ = bbox_preds_.transpose(1, 2).reshape(b, -1, h, w)
 
+            bbox_dist_preds_list.append(bbox_dist_preds)
             cls_scores.append(cls_score)
             bbox_preds.append(bbox_preds_)
-        return tuple(cls_scores), tuple(bbox_preds)
+        if self.training:
+            return tuple(cls_scores), tuple(bbox_preds), tuple(bbox_dist_preds_list)
+        else:
+            return tuple(cls_scores), tuple(bbox_preds)
 
 
 @MODELS.register_module()
@@ -245,6 +250,10 @@ class RTMDetHeadDFL(YOLOv5Head):
                      loss_weight=1.0),
                  loss_bbox: ConfigType = dict(
                      type='mmdet.GIoULoss', loss_weight=2.0),
+                 loss_dfl=dict(
+                     type='mmdet.DistributionFocalLoss',
+                     reduction='mean',
+                     loss_weight=1.5 / 4),
                  train_cfg: OptConfigType = None,
                  test_cfg: OptConfigType = None,
                  init_cfg: OptMultiConfig = None,
@@ -277,6 +286,10 @@ class RTMDetHeadDFL(YOLOv5Head):
             self.register_buffer('cls_weight', torch.tensor(cls_weight))
         else:
             raise NotImplementedError
+        if loss_dfl is None:
+            self.loss_dfl = None
+        else:
+            self.loss_dfl = MODELS.build(loss_dfl)
 
     def special_init(self):
         """Since YOLO series algorithms will inherit from YOLOv5Head, but
@@ -311,6 +324,7 @@ class RTMDetHeadDFL(YOLOv5Head):
             self,
             cls_scores: List[Tensor],
             bbox_preds: List[Tensor],
+            bbox_dist_preds: Sequence[Tensor],
             batch_gt_instances: InstanceList,
             batch_img_metas: List[dict],
             batch_gt_instances_ignore: OptInstanceList = None) -> dict:
@@ -353,6 +367,7 @@ class RTMDetHeadDFL(YOLOv5Head):
                 featmap_sizes, device=device, with_stride=True)
             self.flatten_priors_train = torch.cat(
                 mlvl_priors_with_stride, dim=0)
+            self.stride_tensor = self.flatten_priors_train[..., [2]]
 
         flatten_cls_scores = torch.cat([
             cls_score.permute(0, 2, 3, 1).reshape(num_imgs, -1,
@@ -408,4 +423,33 @@ class RTMDetHeadDFL(YOLOv5Head):
         else:
             loss_bbox = bbox_preds.sum() * 0
 
-        return dict(loss_cls=loss_cls, loss_bbox=loss_bbox)
+        if self.loss_dfl is None:
+            return dict(loss_cls=loss_cls, loss_bbox=loss_bbox)
+        else:
+            flatten_pred_dists = [
+                bbox_pred_org.reshape(num_imgs, -1, self.head_module.reg_max * 4)
+                for bbox_pred_org in bbox_dist_preds
+            ]
+            flatten_dist_preds = torch.cat(flatten_pred_dists, dim=1)
+            # 111 torch.Size([3, 52500, 128]) torch.Size([15])
+            # print('111', flatten_dist_preds.shape, pos_inds.shape)
+            pred_dist_pos = flatten_dist_preds.reshape(-1, self.head_module.reg_max * 4)[pos_inds]
+            assigned_bboxes = assigned_result['assigned_bboxes']
+            # assigned_bboxes_pos = assigned_bboxes.shape([-1, 4])[pos_inds]
+            assigned_ltrb = self.bbox_coder.encode(
+                self.flatten_priors_train[..., :2] / self.stride_tensor,
+                assigned_bboxes,
+                max_dis=self.head_module.reg_max - 1,
+                eps=0.01).reshape([-1, 4])
+            assigned_ltrb_pos = assigned_ltrb[pos_inds]
+            # print('222', assigned_result['assign_metrics'].shape, pos_inds)
+            bbox_weight = assigned_result['assign_metrics'].reshape(-1)[pos_inds].unsqueeze(-1)
+            # print('shape', pred_dist_pos.shape, assigned_ltrb_pos.shape, bbox_weight.shape)
+            # print(pred_dist_pos.shape, assigned_ltrb_pos.reshape(-1).shape, bbox_weight.expand(-1, 4).reshape(-1).shape)
+            loss_dfl = self.loss_dfl(
+                pred_dist_pos.reshape(-1, self.head_module.reg_max),
+                assigned_ltrb_pos.reshape(-1),
+                weight=bbox_weight.expand(-1, 4).reshape(-1),
+                avg_factor=avg_factor)
+
+            return dict(loss_cls=loss_cls, loss_bbox=loss_bbox, loss_dfl=loss_dfl)
