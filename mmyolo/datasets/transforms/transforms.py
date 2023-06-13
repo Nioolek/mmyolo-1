@@ -14,6 +14,7 @@ from mmcv.transforms.utils import cache_randomness
 from mmdet.datasets.transforms import FilterAnnotations as FilterDetAnnotations
 from mmdet.datasets.transforms import LoadAnnotations as MMDET_LoadAnnotations
 from mmdet.datasets.transforms import RandomAffine as MMDET_RandomAffine
+from mmdet.datasets.transforms import RandomCrop as MMDET_RandomCrop
 from mmdet.datasets.transforms import RandomFlip as MMDET_RandomFlip
 from mmdet.datasets.transforms import Resize as MMDET_Resize
 from mmdet.structures.bbox import (HorizontalBoxes, autocast_box_type,
@@ -2445,4 +2446,87 @@ class CopyCropIJCAI(BaseTransform):
         if len(self.cache_images_labels) > self.max_num_cache:
             self.cache_images_labels = self.cache_images_labels[:self.
                                                                 max_num_cache]
+        return results
+
+
+@TRANSFORMS.register_module()
+class RandomCropYOLO(MMDET_RandomCrop):
+    """原版原封不动copy自mmdet,方便后续魔改."""
+
+    def __init__(self,
+                 *args,
+                 width_ratio_thre: float = 0.11,
+                 height_ratio_thre: float = 0.11,
+                 area_ratio_thre: float = 0.08,
+                 **kwargs) -> None:
+        self.width_ratio_thre = width_ratio_thre
+        self.height_ratio_thre = height_ratio_thre
+        self.area_ratio_thre = area_ratio_thre
+        super().__init__(*args, **kwargs)
+
+    def _crop_data(self, results: dict, crop_size: Tuple[int, int],
+                   allow_negative_crop: bool) -> Union[dict, None]:
+        assert crop_size[0] > 0 and crop_size[1] > 0
+        img = results['img']
+        margin_h = max(img.shape[0] - crop_size[0], 0)
+        margin_w = max(img.shape[1] - crop_size[1], 0)
+        offset_h, offset_w = self._rand_offset((margin_h, margin_w))
+        crop_y1, crop_y2 = offset_h, offset_h + crop_size[0]
+        crop_x1, crop_x2 = offset_w, offset_w + crop_size[1]
+
+        # Record the homography matrix for the RandomCrop
+        homography_matrix = np.array(
+            [[1, 0, -offset_w], [0, 1, -offset_h], [0, 0, 1]],
+            dtype=np.float32)
+        if results.get('homography_matrix', None) is None:
+            results['homography_matrix'] = homography_matrix
+        else:
+            results['homography_matrix'] = homography_matrix @ results[
+                'homography_matrix']
+
+        # crop the image
+        img = img[crop_y1:crop_y2, crop_x1:crop_x2, ...]
+        img_shape = img.shape
+        results['img'] = img
+        results['img_shape'] = img_shape[:2]
+
+        # crop bboxes accordingly and clip to the image boundary
+        if results.get('gt_bboxes', None) is not None:
+            bboxes = results['gt_bboxes']
+            # 添加逻辑
+            org_bboxes = bboxes.clone()
+            bboxes.translate_([-offset_w, -offset_h])
+            if self.bbox_clip_border:
+                bboxes.clip_(img_shape[:2])
+
+            # 过滤逻辑
+            # 首先判断宽高
+            org_widths, widths = org_bboxes.widths, bboxes.widths
+            w_valid_inds = ((widths / org_widths) >
+                            self.width_ratio_thre).numpy()
+            org_heights, heights = org_bboxes.heights, bboxes.heights
+            h_valid_inds = ((heights / org_heights) >
+                            self.height_ratio_thre).numpy()
+
+            # 判断面积
+            area_valid_inds = ((bboxes.areas / org_bboxes.areas) >
+                               self.area_ratio_thre).numpy()
+
+            valid_inds = bboxes.is_inside(img_shape[:2]).numpy()
+            valid_inds = valid_inds & w_valid_inds & h_valid_inds & area_valid_inds
+            # If the crop does not contain any gt-bbox area and
+            # allow_negative_crop is False, skip this image.
+            if (not valid_inds.any() and not allow_negative_crop):
+                return None
+
+            results['gt_bboxes'] = bboxes[valid_inds]
+
+            if results.get('gt_ignore_flags', None) is not None:
+                results['gt_ignore_flags'] = \
+                    results['gt_ignore_flags'][valid_inds]
+
+            if results.get('gt_bboxes_labels', None) is not None:
+                results['gt_bboxes_labels'] = \
+                    results['gt_bboxes_labels'][valid_inds]
+
         return results
