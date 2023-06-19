@@ -1,11 +1,12 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
 from mmcv.cnn import ConvModule, is_norm
 from mmdet.models.task_modules.samplers import PseudoSampler
-from mmdet.structures.bbox import distance2bbox
+from mmdet.models.utils import unpack_gt_instances
+from mmdet.structures.bbox import distance2bbox, get_box_tensor
 from mmdet.utils import (ConfigType, InstanceList, OptConfigType,
                          OptInstanceList, OptMultiConfig, reduce_mean)
 from mmengine.model import (BaseModule, bias_init_with_prob, constant_init,
@@ -15,6 +16,54 @@ from torch import Tensor
 from mmyolo.registry import MODELS, TASK_UTILS
 from ..utils import gt_instances_preprocess
 from .yolov5_head import YOLOv5Head
+
+
+def semi_gt_instances_preprocess(batch_gt_instances,
+                                 batch_size: int,
+                                 certain_score_thr: Tensor = 0.6,
+                                 uncertain_score_thr: Tensor = 0.1):
+    if isinstance(batch_gt_instances, Sequence):
+        max_gt_bbox_len = max(
+            [len(gt_instances.bboxes) for gt_instances in batch_gt_instances])
+        # fill zeros with length box_dim+1 if some shape of
+        # single batch not equal max_gt_bbox_len
+        reliable_batch_instance_list = []
+        uncertaion_batch_instance_list = []
+        for index, gt_instance in enumerate(batch_gt_instances):
+            bboxes = gt_instance.bboxes
+            labels = gt_instance.labels.long()
+            # 半监督多个score
+            scores = gt_instance.scores
+            box_dim = get_box_tensor(bboxes).size(-1)
+            res = torch.cat((labels[:, None], bboxes, scores[:, None]), dim=-1)
+            reliable_res = res[scores > certain_score_thr[labels]]
+            reliable_batch_instance_list.append(
+                reliable_res)
+
+            if reliable_res.shape[0] >= max_gt_bbox_len:
+                pass
+            else:
+                fill_tensor = bboxes.new_full([max_gt_bbox_len - reliable_res.shape[0], box_dim + 2], 0)
+                reliable_batch_instance_list[index] = torch.cat(
+                    (reliable_batch_instance_list[index], fill_tensor), dim=0)
+
+            # uncertain_res = res[torch.logical_and(
+            #     scores <= certain_score_thr[labels],
+            #     scores >= uncertain_score_thr[labels])]
+            uncertain_res = res[scores >= uncertain_score_thr[labels]]
+
+            uncertaion_batch_instance_list.append(
+                uncertain_res)
+            if uncertain_res.shape[0] >= max_gt_bbox_len:
+                pass
+            else:
+                fill_tensor = bboxes.new_full([max_gt_bbox_len - uncertain_res.shape[0], box_dim + 2], 0)
+                uncertaion_batch_instance_list[index] = torch.cat(
+                    (uncertaion_batch_instance_list[index], fill_tensor), dim=0)
+
+        return torch.stack(reliable_batch_instance_list), torch.stack(uncertaion_batch_instance_list)
+    else:
+        raise NotImplementedError
 
 
 @MODELS.register_module()
@@ -50,22 +99,22 @@ class RTMDetSepBNHeadModuleDFL(BaseModule):
     """
 
     def __init__(
-        self,
-        num_classes: int,
-        in_channels: int,
-        widen_factor: float = 1.0,
-        num_base_priors: int = 1,
-        feat_channels: int = 256,
-        stacked_convs: int = 2,
-        featmap_strides: Sequence[int] = [8, 16, 32],
-        share_conv: bool = True,
-        pred_kernel_size: int = 1,
-        conv_cfg: OptConfigType = None,
-        norm_cfg: ConfigType = dict(type='BN'),
-        act_cfg: ConfigType = dict(type='SiLU', inplace=True),
-        init_cfg: OptMultiConfig = None,
-        reg_max: int = 32,
-        dfl_scale: float = 1.0
+            self,
+            num_classes: int,
+            in_channels: int,
+            widen_factor: float = 1.0,
+            num_base_priors: int = 1,
+            feat_channels: int = 256,
+            stacked_convs: int = 2,
+            featmap_strides: Sequence[int] = [8, 16, 32],
+            share_conv: bool = True,
+            pred_kernel_size: int = 1,
+            conv_cfg: OptConfigType = None,
+            norm_cfg: ConfigType = dict(type='BN'),
+            act_cfg: ConfigType = dict(type='SiLU', inplace=True),
+            init_cfg: OptMultiConfig = None,
+            reg_max: int = 32,
+            dfl_scale: float = 1.0
     ):
         super().__init__(init_cfg=init_cfg)
         self.share_conv = share_conv
@@ -181,7 +230,6 @@ class RTMDetSepBNHeadModuleDFL(BaseModule):
 
         cls_scores = []
         bbox_preds = []
-        bbox_dist_preds_list = []
         for idx, x in enumerate(feats):
             cls_feat = x
             reg_feat = x
@@ -207,13 +255,11 @@ class RTMDetSepBNHeadModuleDFL(BaseModule):
                 self.proj.view([-1, 1])).squeeze(-1) * self.dfl_scale
             bbox_preds_ = bbox_preds_.transpose(1, 2).reshape(b, -1, h, w)
 
-            bbox_dist_preds_list.append(bbox_dist_preds)
+            # bbox_dist_preds_list.append(bbox_dist_preds)
             cls_scores.append(cls_score)
             bbox_preds.append(bbox_preds_)
-        if self.training:
-            return tuple(cls_scores), tuple(bbox_preds), tuple(bbox_dist_preds_list)
-        else:
-            return tuple(cls_scores), tuple(bbox_preds)
+
+        return tuple(cls_scores), tuple(bbox_preds)
 
 
 @MODELS.register_module()
@@ -259,6 +305,8 @@ class RTMDetHeadDFL(YOLOv5Head):
                  init_cfg: OptMultiConfig = None,
                  cls_weight: Optional[
                      List] = None,  # # Modify by triplemu 2023.06.05
+                 semi_loss_weight: float = 1.0,   # Modify by Ni 2023.06.13
+                 use_semi_uncertain=False
                  ):
 
         super().__init__(
@@ -290,6 +338,34 @@ class RTMDetHeadDFL(YOLOv5Head):
             self.loss_dfl = None
         else:
             self.loss_dfl = MODELS.build(loss_dfl)
+
+        self.use_uncertain_cls_loss = False
+
+        self.semi_loss_weight = semi_loss_weight
+        self.use_semi_uncertain = use_semi_uncertain
+
+        self.certain_threshold = torch.Tensor([
+            0.35,  # 'battery',
+            0.5,  # 'pressure',
+            0.5,  # 'umbrella',
+            0.5,  # 'OCbottle',
+            0.5,  # 'glassbottle',
+            0.5,  # 'lighter',
+            0.5,  # 'electronicequipment',
+            0.35,  # 'knife',
+            0.5,  # 'metalbottle'
+        ]).cuda()
+        self.uncertain_threshold = torch.Tensor([
+            0.2,  # 'battery',
+            0.2,  # 'pressure',
+            0.2,  # 'umbrella',
+            0.2,  # 'OCbottle',
+            0.2,  # 'glassbottle',
+            0.2,  # 'lighter',
+            0.2,  # 'electronicequipment',
+            0.2,  # 'knife',
+            0.2,  # 'metalbottle'
+        ]).cuda()
 
     def special_init(self):
         """Since YOLO series algorithms will inherit from YOLOv5Head, but
@@ -324,7 +400,6 @@ class RTMDetHeadDFL(YOLOv5Head):
             self,
             cls_scores: List[Tensor],
             bbox_preds: List[Tensor],
-            bbox_dist_preds: Sequence[Tensor],
             batch_gt_instances: InstanceList,
             batch_img_metas: List[dict],
             batch_gt_instances_ignore: OptInstanceList = None) -> dict:
@@ -380,7 +455,7 @@ class RTMDetHeadDFL(YOLOv5Head):
             for bbox_pred in bbox_preds
         ], 1)
         flatten_bboxes = flatten_bboxes * self.flatten_priors_train[..., -1,
-                                                                    None]
+        None]
         flatten_bboxes = distance2bbox(self.flatten_priors_train[..., :2],
                                        flatten_bboxes)
 
@@ -388,6 +463,119 @@ class RTMDetHeadDFL(YOLOv5Head):
                                         flatten_cls_scores.detach(),
                                         self.flatten_priors_train, gt_labels,
                                         gt_bboxes, pad_bbox_flag)
+
+        labels = assigned_result['assigned_labels'].reshape(-1)
+        # Modify by triplemu 2023.06.05
+        if self.cls_weight is None:
+            label_weights = assigned_result['assigned_labels_weights'].reshape(
+                -1)
+        elif isinstance(self.cls_weight, torch.Tensor):
+            label_weights = torch.index_select(self.cls_weight, -1, labels)
+        else:
+            raise NotImplementedError
+        bbox_targets = assigned_result['assigned_bboxes'].reshape(-1, 4)
+        assign_metrics = assigned_result['assign_metrics'].reshape(-1)
+        cls_preds = flatten_cls_scores.reshape(-1, self.num_classes)
+        bbox_preds = flatten_bboxes.reshape(-1, 4)
+
+        # FG cat_id: [0, num_classes -1], BG cat_id: num_classes
+        bg_class_ind = self.num_classes
+        pos_inds = ((labels >= 0)
+                    & (labels < bg_class_ind)).nonzero().squeeze(1)
+        avg_factor = reduce_mean(assign_metrics.sum()).clamp_(min=1).item()
+        # print('assign_metrics', assign_metrics, assign_metrics.shape, assign_metrics[assign_metrics>0], assign_metrics[assign_metrics>0].shape)
+        loss_cls = self.loss_cls(
+            cls_preds, (labels, assign_metrics),
+            label_weights,
+            avg_factor=avg_factor)
+
+        if len(pos_inds) > 0:
+            loss_bbox = self.loss_bbox(
+                bbox_preds[pos_inds],
+                bbox_targets[pos_inds],
+                weight=assign_metrics[pos_inds],
+                avg_factor=avg_factor)
+        else:
+            loss_bbox = bbox_preds.sum() * 0
+
+        return dict(loss_cls=loss_cls, loss_bbox=loss_bbox)
+
+    def semi_loss_by_feat(
+            self,
+            cls_scores: List[Tensor],
+            bbox_preds: List[Tensor],
+            batch_gt_instances: InstanceList,
+            batch_img_metas: List[dict],
+            batch_gt_instances_ignore: OptInstanceList = None) -> dict:
+
+        num_imgs = len(batch_img_metas)
+        featmap_sizes = [featmap.size()[-2:] for featmap in cls_scores]
+        assert len(featmap_sizes) == self.prior_generator.num_levels
+
+        cer_gt_info, uncer_gt_info = semi_gt_instances_preprocess(
+            batch_gt_instances, num_imgs,
+            certain_score_thr=self.certain_threshold,
+            uncertain_score_thr=self.uncertain_threshold
+        )
+
+        # certain loss
+        gt_labels = cer_gt_info[:, :, :1]
+        gt_bboxes = cer_gt_info[:, :, 1:1 + 4]  # xyxy
+        gt_scores = cer_gt_info[:, :, -1:]
+
+        pad_bbox_flag = (gt_bboxes.sum(-1, keepdim=True) > 0).float()
+
+        device = cls_scores[0].device
+
+        # If the shape does not equal, generate new one
+        if featmap_sizes != self.featmap_sizes_train:
+            self.featmap_sizes_train = featmap_sizes
+            mlvl_priors_with_stride = self.prior_generator.grid_priors(
+                featmap_sizes, device=device, with_stride=True)
+            self.flatten_priors_train = torch.cat(
+                mlvl_priors_with_stride, dim=0)
+            self.stride_tensor = self.flatten_priors_train[..., [2]]
+
+        flatten_cls_scores = torch.cat([
+            cls_score.permute(0, 2, 3, 1).reshape(num_imgs, -1,
+                                                  self.cls_out_channels)
+            for cls_score in cls_scores
+        ], 1).contiguous()
+
+        flatten_bboxes = torch.cat([
+            bbox_pred.permute(0, 2, 3, 1).reshape(num_imgs, -1, 4)
+            for bbox_pred in bbox_preds
+        ], 1)
+        flatten_bboxes = flatten_bboxes * self.flatten_priors_train[..., -1,
+        None]
+        flatten_bboxes = distance2bbox(self.flatten_priors_train[..., :2],
+                                       flatten_bboxes)
+
+        assigned_result = self.assigner(flatten_bboxes.detach(),
+                                        flatten_cls_scores.detach(),
+                                        self.flatten_priors_train, gt_labels,
+                                        gt_bboxes, pad_bbox_flag)
+        if self.use_semi_uncertain:
+            gt_labels_uc = uncer_gt_info[:, :, :1]
+            gt_bboxes_uc = uncer_gt_info[:, :, 1:1 + 4]
+            gt_scores_uc = uncer_gt_info[:, :, -1:]
+            pad_bbox_flag_uc = (gt_bboxes_uc.sum(-1, keepdim=True) > 0).float()
+            semi_assigned_result = self.assigner(flatten_bboxes.detach(),
+                                                 flatten_cls_scores.detach(),
+                                                 self.flatten_priors_train, gt_labels_uc,
+                                                 gt_bboxes_uc, pad_bbox_flag_uc)
+            cls_preds_uc = flatten_cls_scores.reshape(-1, self.num_classes)
+            labels_uc = semi_assigned_result['assigned_labels'].reshape(-1)
+            assign_metrics_uc = semi_assigned_result['assign_metrics'].reshape(-1)
+            label_weights_uc = semi_assigned_result['assigned_labels_weights'].reshape(
+                -1)
+            inds = assign_metrics_uc > 0
+            avg_factor = reduce_mean(label_weights_uc.sum()).clamp_(min=1).item()
+            un_loss_cls = self.loss_cls(
+                cls_preds_uc[inds], (labels_uc[inds], assign_metrics_uc[inds]),
+                label_weights_uc[inds],
+                avg_factor=avg_factor)
+            print('un_loss_cls', un_loss_cls)
 
         labels = assigned_result['assigned_labels'].reshape(-1)
         # Modify by triplemu 2023.06.05
@@ -423,33 +611,26 @@ class RTMDetHeadDFL(YOLOv5Head):
         else:
             loss_bbox = bbox_preds.sum() * 0
 
-        if self.loss_dfl is None:
-            return dict(loss_cls=loss_cls, loss_bbox=loss_bbox)
-        else:
-            flatten_pred_dists = [
-                bbox_pred_org.reshape(num_imgs, -1, self.head_module.reg_max * 4)
-                for bbox_pred_org in bbox_dist_preds
-            ]
-            flatten_dist_preds = torch.cat(flatten_pred_dists, dim=1)
-            # 111 torch.Size([3, 52500, 128]) torch.Size([15])
-            # print('111', flatten_dist_preds.shape, pos_inds.shape)
-            pred_dist_pos = flatten_dist_preds.reshape(-1, self.head_module.reg_max * 4)[pos_inds]
-            assigned_bboxes = assigned_result['assigned_bboxes']
-            # assigned_bboxes_pos = assigned_bboxes.shape([-1, 4])[pos_inds]
-            assigned_ltrb = self.bbox_coder.encode(
-                self.flatten_priors_train[..., :2] / self.stride_tensor,
-                assigned_bboxes,
-                max_dis=self.head_module.reg_max - 1,
-                eps=0.01).reshape([-1, 4])
-            assigned_ltrb_pos = assigned_ltrb[pos_inds]
-            # print('222', assigned_result['assign_metrics'].shape, pos_inds)
-            bbox_weight = assigned_result['assign_metrics'].reshape(-1)[pos_inds].unsqueeze(-1)
-            # print('shape', pred_dist_pos.shape, assigned_ltrb_pos.shape, bbox_weight.shape)
-            # print(pred_dist_pos.shape, assigned_ltrb_pos.reshape(-1).shape, bbox_weight.expand(-1, 4).reshape(-1).shape)
-            loss_dfl = self.loss_dfl(
-                pred_dist_pos.reshape(-1, self.head_module.reg_max),
-                assigned_ltrb_pos.reshape(-1),
-                weight=bbox_weight.expand(-1, 4).reshape(-1),
-                avg_factor=avg_factor)
+        # TODO: uncertain loss
 
-            return dict(loss_cls=loss_cls, loss_bbox=loss_bbox, loss_dfl=loss_dfl)
+        if self.use_semi_uncertain:
+            return dict(semi_loss_cls=loss_cls * self.semi_loss_weight,
+                        semi_loss_bbox=loss_bbox * self.semi_loss_weight,
+                        un_loss_cls=un_loss_cls * self.semi_loss_weight)
+        else:
+            return dict(semi_loss_cls=loss_cls * self.semi_loss_weight,
+                        semi_loss_bbox=loss_bbox * self.semi_loss_weight)
+
+    def semi_loss(self, semi_x: Tuple[Tensor],
+                  semi_batch_data_samples: Union[list,
+                  dict]) -> dict:
+        outs = self(semi_x)
+
+        outputs = unpack_gt_instances(semi_batch_data_samples)
+        (batch_gt_instances, batch_gt_instances_ignore,
+         batch_img_metas) = outputs
+
+        loss_inputs = outs + (batch_gt_instances, batch_img_metas,
+                              batch_gt_instances_ignore)
+        semi_losses = self.semi_loss_by_feat(*loss_inputs)
+        return semi_losses

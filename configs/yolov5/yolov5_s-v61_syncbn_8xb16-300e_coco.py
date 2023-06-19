@@ -20,11 +20,15 @@ persistent_workers = True
 
 # -----model related-----
 # Basic size of multi-scale prior box
-anchors = [
-    [(10, 13), (16, 30), (33, 23)],  # P3/8
-    [(30, 61), (62, 45), (59, 119)],  # P4/16
-    [(116, 90), (156, 198), (373, 326)]  # P5/32
-]
+# anchors = [
+#     [(10, 13), (16, 30), (33, 23)],  # P3/8
+#     [(30, 61), (62, 45), (59, 119)],  # P4/16
+#     [(116, 90), (156, 198), (373, 326)]  # P5/32
+# ]
+
+anchors = [[(29, 55), (65, 35), (57, 75)],
+           [(65, 145), (155, 62), (102, 98)],
+           [(121, 175), (201, 119), (239, 230)]]
 
 # -----train val related-----
 # Base learning rate for optim_wrapper. Corresponding to 8xb16=128 bs
@@ -88,6 +92,13 @@ max_keep_ckpts = 3
 # Single-scale training is recommended to
 # be turned on, which can speed up training.
 env_cfg = dict(cudnn_benchmark=True)
+
+metainfo = dict(
+    classes=('battery', 'pressure', 'umbrella', 'OCbottle', 'glassbottle',
+             'lighter', 'electronicequipment', 'knife', 'metalbottle'),
+    palette=[(220, 20, 60), (119, 11, 32), (0, 0, 142), (0, 0, 230),
+             (106, 0, 228), (0, 60, 100), (0, 80, 100), (0, 0, 70),
+             (0, 0, 192)])
 
 # ===============================Unmodified in most cases====================
 model = dict(
@@ -203,6 +214,7 @@ train_dataloader = dict(
     pin_memory=True,
     sampler=dict(type='DefaultSampler', shuffle=True),
     dataset=dict(
+        metainfo=metainfo,
         type=dataset_type,
         data_root=data_root,
         ann_file=train_ann_file,
@@ -233,6 +245,7 @@ val_dataloader = dict(
     drop_last=False,
     sampler=dict(type='DefaultSampler', shuffle=False),
     dataset=dict(
+        metainfo=metainfo,
         type=dataset_type,
         data_root=data_root,
         test_mode=True,
