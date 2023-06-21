@@ -1,4 +1,16 @@
-_base_ = './rtmdet_x_comp_1280_yang3.py'
+_base_ = './rtmdet_x_comp_1280_yang5.py'
+
+# 相比较yang3_semi_a40添加的内容：
+# 1、数据增强增加random flip vertical
+# 2、数据增强增加randomrotate
+# 3、copypaste1里增加randomrotate
+# 4、修复copypaste1失败的情况
+# 5、efficient teacher里，nms改成softnms
+# 6、switch从180改为200
+
+# 待添加事项：
+# 1、半监督预先加载一些标注数据
+# 2、
 
 # 先是网络部分
 detector = _base_.model
@@ -32,7 +44,7 @@ model = dict(
 # 再是数据部分
 dataset_type = _base_.dataset_type
 data_root = _base_.data_root
-img_scale = (1280, 1280)  # width, height
+img_scale = (1408, 1408)  # width, height
 batch_size = 2
 semi_batch_size = batch_size
 num_workers = 10
@@ -74,7 +86,9 @@ sup_pipeline = [
         }),
     dict(type='mmdet.YOLOXHSVRandomAug'),
     dict(type='mmdet.RandomFlip', prob=0.5),
+    dict(type='mmdet.RandomFlip', prob=0.5, direction='vertical'),
     dict(type='mmdet.Pad', size=img_scale, pad_val=dict(img=(114, 114, 114))),
+    dict(type='RandomRotateYOLO'),
     dict(
         type='YOLOv5MixUp',
         use_cached=True,
@@ -205,13 +219,13 @@ custom_hooks = [
         priority=49),
     dict(
         type='DataloaderSwitchHook',
-        switch_epoch=180,
+        switch_epoch=200,
         switch_dataloader=train_dataloader_semi,
         # 貌似可以删除
         switch_data_preprocessor=semi_data_preprocessor)
 ]
 
-# # val and test switch
+# val and test switch
 # test_image_info = 'annotations/instances_test2017.json'
 # test_image = 'test2017/'
 
@@ -241,7 +255,7 @@ _test_evaluator = dict(
     ann_file=_base_.data_root + test_image_info,
     metric='bbox',
     format_only=True,  # 只将模型输出转换为coco的 JSON 格式并保存
-    outfile_prefix='test-date0619_190e_nms095',  # 要保存的 JSON 文件的前缀
+    outfile_prefix='test-date0620_softnms065_175e',  # 要保存的 JSON 文件的前缀
 )
 
 # # Reduce evaluation time
@@ -251,10 +265,9 @@ _test_evaluator = dict(
 #     # # ann_file=data_root + val_ann_file,
 #     # metric='bbox',
 #     format_only=True,  # 只将模型输出转换为coco的 JSON 格式并保存
-#     outfile_prefix='val-date0619_190e'
+#     outfile_prefix='val-date0620_175e_nms095'
 # )
 # test_evaluator = val_evaluator
-
 
 test_dataloader = _test_dataloader
 test_evaluator = _test_evaluator

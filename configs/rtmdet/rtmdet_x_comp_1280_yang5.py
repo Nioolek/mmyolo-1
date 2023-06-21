@@ -19,7 +19,7 @@ val_batch_size_per_gpu = 1
 base_lr = 0.004 / 8
 max_epochs = 300  # Maximum training epochs
 
-img_scale = (1280, 1280)  # width, height
+img_scale = (1408, 1408)  # width, height
 
 # Config of batch shapes. Only on val.
 batch_shapes_cfg = dict(
@@ -97,7 +97,9 @@ train_pipeline = [
         }),
     dict(type='mmdet.YOLOXHSVRandomAug'),
     dict(type='mmdet.RandomFlip', prob=0.5),
+    dict(type='mmdet.RandomFlip', prob=0.5, direction='vertical'),
     dict(type='mmdet.Pad', size=img_scale, pad_val=dict(img=(114, 114, 114))),
+    dict(type='RandomRotateYOLO'),
     dict(
         type='YOLOv5MixUp',
         use_cached=True,
@@ -117,7 +119,9 @@ train_pipeline_stage2 = [
     dict(type='mmdet.RandomCrop', crop_size=img_scale),
     dict(type='mmdet.YOLOXHSVRandomAug'),
     dict(type='mmdet.RandomFlip', prob=0.5),
+    dict(type='mmdet.RandomFlip', prob=0.5, direction='vertical'),
     dict(type='mmdet.Pad', size=img_scale, pad_val=dict(img=(114, 114, 114))),
+    dict(type='RandomRotate'),
     dict(type='mmdet.PackDetInputs')
 ]
 
@@ -208,9 +212,7 @@ train_cfg = dict(
                         val_interval_stage2)])
 
 img_scales = [(int(img_scale[0] * i), int(img_scale[1] * i))
-              for i in (1,)
-              # for i in (1, 0.5, 1.5)
-              ]
+              for i in (1, 0.5, 1.5)]
 
 _multiscale_resize_transforms = [
     dict(
@@ -244,10 +246,6 @@ tta_pipeline = [
             ]
         ])
 ]
-tta_model = {
-    'type': 'mmdet.DetTTAModel',
-    'tta_cfg': {'nms': {'type': 'nms', 'iou_threshold': 0.65},
-                'max_per_img': 300}}
 
 # runtime settings
 load_from = 'weights/rtmdet_x_syncbn_fast_8xb32-300e_coco_20221231_100345-b85cd476.pth'  # noqa

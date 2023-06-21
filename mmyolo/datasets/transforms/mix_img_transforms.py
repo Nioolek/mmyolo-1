@@ -12,6 +12,7 @@ from mmengine.dataset import BaseDataset
 from mmengine.dataset.base_dataset import Compose
 from numpy import random
 
+from mmyolo.datasets.transforms.transforms import RandomRotateYOLO
 from mmyolo.registry import TRANSFORMS
 
 
@@ -292,6 +293,8 @@ class Mosaic(BaseMixImageTransform):
         self.bbox_clip_border = bbox_clip_border
         self.pad_val = pad_val
 
+        self.rot_tran = RandomRotateYOLO()
+
     def get_indexes(self, dataset: Union[BaseDataset, list]) -> list:
         """Call function to collect indexes.
 
@@ -346,6 +349,8 @@ class Mosaic(BaseMixImageTransform):
             else:
                 results_patch = results['mix_results'][i - 1]
 
+            # 加个随机旋转
+            results_patch = self.rot_tran(results_patch)
             img_i = results_patch['img']
             h_i, w_i = img_i.shape[:2]
             # keep_ratio resize

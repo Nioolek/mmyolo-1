@@ -16,7 +16,7 @@ from mmengine.model import is_model_wrapper
 from mmengine.optim import OptimWrapper
 from mmengine.runner import Runner
 from mmdet.utils import ConfigType, InstanceList, OptConfigType, OptMultiConfig
-from mmdet.models import SemiBaseDetector, DetDataPreprocessor, MultiBranchDataPreprocessor
+from mmdet.models import SemiBaseDetector, DetDataPreprocessor, MultiBranchDataPreprocessor, DetTTAModel
 from mmengine.structures import InstanceData
 from torch import Tensor
 import numpy as np
@@ -54,7 +54,7 @@ class EfficientTeacher(SemiBaseDetector):
             'multi_label': False,
             'nms_conf_thres': nms_conf_thres,
             'nms_iou_thres': nms_iou_thres,
-            'type': 'nms',
+            'type': 'soft_nms',
             'max_per_img': 300
         }
         self.featmap_sizes = None
@@ -456,20 +456,35 @@ class EfficientTeacherHook(Hook):
         model = runner.model
         if is_model_wrapper(model):
             model = model.module
-        assert hasattr(model, 'teacher')
-        assert hasattr(model, 'student')
-        assert model.teacher == None
-        self.src_model = model.student
+        if hasattr(model, 'teacher'):
+            assert hasattr(model, 'teacher')
+            assert hasattr(model, 'student')
+            assert model.teacher == None
+            self.src_model = model.student
 
-        ema_type = self.ema_cfg.pop('ema_type')
-        self.ema_cfg['type'] = ema_type
+            ema_type = self.ema_cfg.pop('ema_type')
+            self.ema_cfg['type'] = ema_type
 
-        self.ema_model = MODELS.build(self.ema_cfg, default_args=dict(model=self.src_model)).eval()
-        print('set teacher no grad')
-        for p in self.ema_model.parameters():
-            p.requires_grad_(False)
-        model.teacher = self.ema_model
-        model.init_teacher = True
+            self.ema_model = MODELS.build(self.ema_cfg, default_args=dict(model=self.src_model)).eval()
+            print('set teacher no grad')
+            for p in self.ema_model.parameters():
+                p.requires_grad_(False)
+            model.teacher = self.ema_model
+            model.init_teacher = True
+        else:
+            assert isinstance(model, DetTTAModel)
+            self.src_model = model.module.student
+
+            ema_type = self.ema_cfg.pop('ema_type')
+            self.ema_cfg['type'] = ema_type
+
+            self.ema_model = MODELS.build(self.ema_cfg, default_args=dict(model=self.src_model)).eval()
+            print('set teacher no grad')
+            for p in self.ema_model.parameters():
+                p.requires_grad_(False)
+            model.module.teacher = self.ema_model
+            model.module.init_teacher = True
+
 
     def before_train(self, runner) -> None:
         if (self.copy_para is False) and (not runner._resume):

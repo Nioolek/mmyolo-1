@@ -2427,222 +2427,236 @@ class CopyPasteIJCAI1(BaseTransform):
 
         self.save_count = -30
 
+        self.rot_tran = RandomRotateYOLO()
+
     def transform(self,
                   results):
-        try:
-            # 流程：
-            import random
-            img = results['img']
-            gt_bboxes = results['gt_bboxes']
-            gt_bboxes_labels = results['gt_bboxes_labels']
-            gt_ignore_flags = results['gt_ignore_flags']
+        # try:
+        # 流程：
+        import random
+        img = results['img']
+        gt_bboxes = results['gt_bboxes']
+        gt_bboxes_labels = results['gt_bboxes_labels']
+        gt_ignore_flags = results['gt_ignore_flags']
 
-            # 1、cache 标签和图片
-            for i in range(len(gt_bboxes)):
-                left = int(gt_bboxes.tensor.numpy()[0][0])
-                lower = int(gt_bboxes.tensor.numpy()[0][1])
-                right = int(gt_bboxes.tensor.numpy()[0][2])
-                upper = int(gt_bboxes.tensor.numpy()[0][3])
-                class_name = gt_bboxes_labels[i]
-                if left == right or upper == lower:
+        # 1、cache 标签和图片
+        for i in range(len(gt_bboxes)):
+            left = int(gt_bboxes.tensor.numpy()[0][0])
+            lower = int(gt_bboxes.tensor.numpy()[0][1])
+            right = int(gt_bboxes.tensor.numpy()[0][2])
+            upper = int(gt_bboxes.tensor.numpy()[0][3])
+            class_name = gt_bboxes_labels[i]
+            if left == right or upper == lower:
+                continue
+
+            # 随机生成裁剪的坐标
+            if self.random_crop:
+                img_h, img_w = img.shape[:2]
+                left = int(min(max(0, left-(right-left)*random.uniform(self.n[0], self.n[1])), img_w-1))
+                right = int(min(max(0, right + (right - left) * random.uniform(self.n[0], self.n[1])), img_w-1))
+                lower = int(min(max(0, lower - (upper - lower) * random.uniform(self.n[0], self.n[1])), img_h-1))
+                upper = int(min(max(0, upper + (upper-lower) * random.uniform(self.n[0], self.n[1])), img_h-1))
+
+            cropped = img[lower:upper, left:right]  # (left, upper, right, lower)
+
+            new_gt_bboxes = gt_bboxes.clone()
+            # 保留在图片里的标注
+            keep_inds = self.get_keep_indexes(new_gt_bboxes, np.array([[left, lower, right, upper]], dtype=np.float32))
+            # print(keep_inds)
+            new_gt_bboxes = new_gt_bboxes[keep_inds]
+            new_gt_bboxes.translate_([-left, -lower])
+            new_gt_bboxes.clip_([upper-lower, right-left])
+            new_gt_bboxes_labels = gt_bboxes_labels[keep_inds]
+
+            # 存储裁剪图，裁剪图在原来的坐标，gt索引，标注bbox信息， 标注label信息
+            self.cache_list.append([cropped.copy(), [left, lower, right, upper],
+                                    i, new_gt_bboxes, new_gt_bboxes_labels, (right-left)*(upper-lower)])
+            if self.class_soft:
+                if random.random() < 2 * self.class_p[int(class_name)]:
+                    self.cache_list.append([cropped.copy(), [left, lower, right, upper],
+                                            i, gt_bboxes.clone(), gt_bboxes_labels.copy(), (right-left)*(upper-lower)])
+
+        if self.save_count<=0:
+            self.save_count+=1
+            return results
+
+        if 'dataset' in results:
+            dataset = results['dataset']
+            results.pop('dataset')
+            flag = True
+        else:
+            dataset = None
+            flag = False
+
+
+        # 2、判断是否满足开始贴图的条件
+        if len(gt_bboxes_labels) <= 20:
+            mixup_number = 4 + self.mix_number
+        else:
+            mixup_number = self.mix_number
+
+        # 贴图结果存储
+        copypaste_img = np.zeros_like(img)
+        copypaste_mask = np.zeros((img.shape[0], img.shape[1]), dtype=bool)
+        copypaste_bbox_list = []
+        copypaste_labels_list = []
+
+        # 3、选择贴图的框
+        # print('!!!', len(self.cache_list),mixup_number, min(mixup_number, len(self.cache_list)))
+        indexes = random.choices(range(max(mixup_number, len(self.cache_list))), k=mixup_number)
+        # 按照面积排序，先贴小目标。先贴小目标的目的是优化小目标
+        indexes = sorted(indexes, key=lambda x: self.cache_list[x][-1])
+
+        for index in indexes:
+            copy_img, copy_bbox, gt_ind, copy_gt_bboxes, copy_gt_bboxes_labels, area = self.cache_list[index]
+            x1, y1, x2, y2 = copy_bbox
+            # copy_gt_bboxes_tensor = copy_gt_bboxes.tensor
+            temp_gt_bboxes = copy_gt_bboxes.clone()
+
+            # 暂时没法用旋转
+            # if change_rotate:
+            #     # 随机旋转
+            #     if random.random() < 0.75:
+            #         im = np.rot90(im, [1,-1,2][random.randint(0,2)])
+            #     else:
+            #         pass
+            W = copy_img.shape[1]
+            H = copy_img.shape[0]
+            # 随机的rescale贴图的大小
+            if self.change_size:
+                scale = random.uniform(1 - self.new_scale, 1 + self.new_scale)
+                new_W = int(W * scale)
+                new_H = int(H * scale)
+                if new_H == 0 or new_W == 0:
+                    continue
+                copy_img = cv2.resize(copy_img, (new_W, new_H))
+                temp_gt_bboxes.rescale_((scale, scale))
+                # x2, y2 = x2 + new_W - W, y2 + new_H - H
+                # copy_gt_bboxes_tensor[:, 2] += new_W - W
+                # copy_gt_bboxes_tensor[:, 3] += new_H - H
+                W, H = new_W, new_H
+                area = W*H
+
+            # 水平翻转
+            if random.random() < 0.5:
+                copy_img = copy_img[:, ::-1]
+                temp_gt_bboxes.flip_(copy_img.shape[:2])
+
+            # 垂直翻转
+            if random.random() < 0.5:
+                copy_img = copy_img[::-1]
+                temp_gt_bboxes.flip_(copy_img.shape[:2], direction='vertical')
+
+            # 随机旋转
+            temp_results = self.rot_tran({
+                'img': copy_img,
+                'gt_bboxes': temp_gt_bboxes
+            })
+            copy_img = temp_results['img']
+            temp_gt_bboxes = temp_results['gt_bboxes']
+            H, W = copy_img.shape[:2]
+
+            if (copypaste_img.shape[1] - W < 3) or (copypaste_img.shape[0] - H < 3):
+                continue
+
+            # 尝试贴图5次，超过5次仍然失败就跳过
+            for i in range(5):
+                # print(copypaste_img.shape, copy_img.shape, copypaste_img.shape[1] - W, copypaste_img.shape[0] - H)
+                # 计算贴图的地方
+                paste_x1, paste_y1 = random.randint(0, copypaste_img.shape[1] - W), random.randint(0, copypaste_img.shape[0] - H)
+                # 由于从小目标开始贴，那就要求后贴的目标不能与之前的目标有任何重合
+                flag_copy = copypaste_mask[paste_y1:paste_y1+H, paste_x1:paste_x1+W].sum()
+                if flag_copy > 0:
                     continue
 
-                # 随机生成裁剪的坐标
-                if self.random_crop:
-                    img_h, img_w = img.shape[:2]
-                    left = int(min(max(0, left-(right-left)*random.uniform(self.n[0], self.n[1])), img_w-1))
-                    right = int(min(max(0, right + (right - left) * random.uniform(self.n[0], self.n[1])), img_w-1))
-                    lower = int(min(max(0, lower - (upper - lower) * random.uniform(self.n[0], self.n[1])), img_h-1))
-                    upper = int(min(max(0, upper + (upper-lower) * random.uniform(self.n[0], self.n[1])), img_h-1))
+                # TODO:待添加box jitter
+                # temp_gt_bboxes = copy_gt_bboxes.clone()
 
-                cropped = img[lower:upper, left:right]  # (left, upper, right, lower)
+                # # box jitter
+                # bbox_jitter_l = 30
+                # temp_gt_bboxes.tensor += torch.tensor(np.random.uniform(-bbox_jitter_l, bbox_jitter_l, (len(temp_gt_bboxes), 4)) * 0.001)
+                # temp_gt_bboxes.clip_(copy_img.shape[:2])
 
-                new_gt_bboxes = gt_bboxes.clone()
-                # 保留在图片里的标注
-                keep_inds = self.get_keep_indexes(new_gt_bboxes, np.array([[left, lower, right, upper]], dtype=np.float32))
-                # print(keep_inds)
-                new_gt_bboxes = new_gt_bboxes[keep_inds]
-                new_gt_bboxes.translate_([-left, -lower])
-                new_gt_bboxes.clip_([upper-lower, right-left])
-                new_gt_bboxes_labels = gt_bboxes_labels[keep_inds]
+                # 到这里表示可以贴图,并将贴图结果放到list当中
+                copypaste_mask[paste_y1:paste_y1+H, paste_x1:paste_x1+W] = True
+                copypaste_img[paste_y1:paste_y1+H, paste_x1:paste_x1+W] = copy_img
+                assert len(copy_gt_bboxes) == len(copy_gt_bboxes_labels)
 
-                # 存储裁剪图，裁剪图在原来的坐标，gt索引，标注bbox信息， 标注label信息
-                self.cache_list.append([cropped.copy(), [left, lower, right, upper],
-                                        i, new_gt_bboxes, new_gt_bboxes_labels, (right-left)*(upper-lower)])
-                if self.class_soft:
-                    if random.random() < 2 * self.class_p[int(class_name)]:
-                        self.cache_list.append([cropped.copy(), [left, lower, right, upper],
-                                                i, gt_bboxes.clone(), gt_bboxes_labels.copy(), (right-left)*(upper-lower)])
+                # 过滤小目标
+                filter_indexes = torch.logical_and(temp_gt_bboxes.widths > 16, temp_gt_bboxes.heights > 16)
+                # print(filter_indexes)
+                temp_gt_bboxes = temp_gt_bboxes[filter_indexes]
+                copy_gt_bboxes_labels = copy_gt_bboxes_labels[filter_indexes.numpy()]
 
-            if self.save_count<=0:
-                self.save_count+=1
-                return results
+                temp_gt_bboxes.translate_([paste_x1, paste_y1])
+                copypaste_bbox_list.append(temp_gt_bboxes)
+                copypaste_labels_list.append(copy_gt_bboxes_labels)
+                break
 
-            if 'dataset' in results:
-                dataset = results['dataset']
-                results.pop('dataset')
-                flag = True
-            else:
-                dataset = None
-                flag = False
+        # 4、最终训练图合成
+        r = np.random.beta(32.0, 32.0)
+        copypaste_img = (copypaste_img.astype(float) * r + img.astype(float) * (1.0 - r)).astype(np.uint8)
+        img[copypaste_mask] = copypaste_img[copypaste_mask]
 
+        # bbox
+        # draw_gt_bboxes = gt_bboxes.clone()
+        # draw_gt_bboxes_labels = gt_bboxes_labels.copy()
+        gt_bboxes = gt_bboxes.cat([gt_bboxes] + copypaste_bbox_list)
+        gt_bboxes_labels = np.concatenate([gt_bboxes_labels] + copypaste_labels_list)
+        assert len(gt_bboxes) == len(gt_bboxes_labels)
 
-            # 2、判断是否满足开始贴图的条件
-            if len(gt_bboxes_labels) <= 20:
-                mixup_number = 4 + self.mix_number
-            else:
-                mixup_number = self.mix_number
-
-            # 贴图结果存储
-            copypaste_img = np.zeros_like(img)
-            copypaste_mask = np.zeros((img.shape[0], img.shape[1]), dtype=bool)
-            copypaste_bbox_list = []
-            copypaste_labels_list = []
-
-            # 3、选择贴图的框
-            # print('!!!', len(self.cache_list),mixup_number, min(mixup_number, len(self.cache_list)))
-            indexes = random.choices(range(max(mixup_number, len(self.cache_list))), k=mixup_number)
-            # 按照面积排序，先贴小目标。先贴小目标的目的是优化小目标
-            indexes = sorted(indexes, key=lambda x: self.cache_list[x][-1])
-
-            for index in indexes:
-                copy_img, copy_bbox, gt_ind, copy_gt_bboxes, copy_gt_bboxes_labels, area = self.cache_list[index]
-                x1, y1, x2, y2 = copy_bbox
-                # copy_gt_bboxes_tensor = copy_gt_bboxes.tensor
-                temp_gt_bboxes = copy_gt_bboxes.clone()
-
-                # 暂时没法用旋转
-                # if change_rotate:
-                #     # 随机旋转
-                #     if random.random() < 0.75:
-                #         im = np.rot90(im, [1,-1,2][random.randint(0,2)])
-                #     else:
-                #         pass
-                W = copy_img.shape[1]
-                H = copy_img.shape[0]
-                # 随机的rescale贴图的大小
-                if self.change_size:
-                    scale = random.uniform(1 - self.new_scale, 1 + self.new_scale)
-                    new_W = int(W * scale)
-                    new_H = int(H * scale)
-                    if new_H == 0 or new_W == 0:
-                        continue
-                    copy_img = cv2.resize(copy_img, (new_W, new_H))
-                    temp_gt_bboxes.rescale_((scale, scale))
-                    # x2, y2 = x2 + new_W - W, y2 + new_H - H
-                    # copy_gt_bboxes_tensor[:, 2] += new_W - W
-                    # copy_gt_bboxes_tensor[:, 3] += new_H - H
-                    W, H = new_W, new_H
-                    area = W*H
-
-                # 尝试贴图5次，超过5次仍然失败就跳过
-                for i in range(5):
-                    # print(copypaste_img.shape, copy_img.shape, copypaste_img.shape[1] - W, copypaste_img.shape[0] - H)
-                    # 计算贴图的地方
-                    paste_x1, paste_y1 = random.randint(0, copypaste_img.shape[1] - W), random.randint(0, copypaste_img.shape[0] - H)
-                    # 由于从小目标开始贴，那就要求后贴的目标不能与之前的目标有任何重合
-                    flag_copy = copypaste_mask[paste_y1:paste_y1+H, paste_x1:paste_x1+W].sum()
-                    if flag_copy > 0:
-                        continue
-
-                    # TODO:待添加随机旋转、翻转
-                    # TODO:待添加box jitter
-                    # temp_gt_bboxes = copy_gt_bboxes.clone()
-                    # 水平翻转
-                    if random.random() < 0.5:
-                        copy_img = copy_img[:, ::-1]
-                        temp_gt_bboxes.flip_(copy_img.shape[:2])
-
-                    # 垂直翻转
-                    if random.random() < 0.5:
-                        copy_img = copy_img[::-1]
-                        temp_gt_bboxes.flip_(copy_img.shape[:2], direction='vertical')
-
-                    # # box jitter
-                    # bbox_jitter_l = 30
-                    # temp_gt_bboxes.tensor += torch.tensor(np.random.uniform(-bbox_jitter_l, bbox_jitter_l, (len(temp_gt_bboxes), 4)) * 0.001)
-                    # temp_gt_bboxes.clip_(copy_img.shape[:2])
-
-                    # 到这里表示可以贴图,并将贴图结果放到list当中
-                    copypaste_mask[paste_y1:paste_y1+H, paste_x1:paste_x1+W] = True
-                    copypaste_img[paste_y1:paste_y1+H, paste_x1:paste_x1+W] = copy_img
-                    assert len(copy_gt_bboxes) == len(copy_gt_bboxes_labels)
-
-                    # 过滤小目标
-                    filter_indexes = torch.logical_and(temp_gt_bboxes.widths > 16, temp_gt_bboxes.heights > 16)
-                    # print(filter_indexes)
-                    temp_gt_bboxes = temp_gt_bboxes[filter_indexes]
-                    copy_gt_bboxes_labels = copy_gt_bboxes_labels[filter_indexes.numpy()]
-
-                    temp_gt_bboxes.translate_([paste_x1, paste_y1])
-                    copypaste_bbox_list.append(temp_gt_bboxes)
-                    copypaste_labels_list.append(copy_gt_bboxes_labels)
-                    break
-
-            # 4、最终训练图合成
-            r = np.random.beta(32.0, 32.0)
-            copypaste_img = (copypaste_img.astype(float) * r + img.astype(float) * (1.0 - r)).astype(np.uint8)
-            img[copypaste_mask] = copypaste_img[copypaste_mask]
-
-            # bbox
-            # draw_gt_bboxes = gt_bboxes.clone()
-            # draw_gt_bboxes_labels = gt_bboxes_labels.copy()
-            gt_bboxes = gt_bboxes.cat([gt_bboxes] + copypaste_bbox_list)
-            gt_bboxes_labels = np.concatenate([gt_bboxes_labels] + copypaste_labels_list)
-            assert len(gt_bboxes) == len(gt_bboxes_labels)
-
-            # 过滤
+        # 过滤
 
 
-            # if self.save_count <= 200
-            # 可视化
-            # classesname = ['battery', 'pressure', 'umbrella', 'OCbottle', 'glassbottle', 'lighter', 'electronicequipment',
-            #                'knife', 'metalbottle']
-            # for label, label1 in zip(gt_bboxes, gt_bboxes_labels):
-            #     x_min = int(label.tensor.numpy()[0][0])
-            #     y_min = int(label.tensor.numpy()[0][1])
-            #     x_max = int(label.tensor.numpy()[0][2])
-            #     y_max = int(label.tensor.numpy()[0][3])
-            #     name = int(label1)
-            #
-            #     cv2.rectangle(img, (x_min, y_min), (x_max, y_max), (0, 0, 0), 2)
-            #     cv2.putText(img, str(classesname[name]), (x_min, y_min), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
-            #
-            # for label, label1 in zip(draw_gt_bboxes, draw_gt_bboxes_labels):
-            #     x_min = int(label.tensor.numpy()[0][0])
-            #     y_min = int(label.tensor.numpy()[0][1])
-            #     x_max = int(label.tensor.numpy()[0][2])
-            #     y_max = int(label.tensor.numpy()[0][3])
-            #     name = int(label1)
-            #
-            #     cv2.rectangle(img, (x_min, y_min), (x_max, y_max), (0, 0, 255), 2)
-            #     cv2.putText(img, str(classesname[name]), (x_min, y_min), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-            #
-            # # cv2.namedWindow("Demo", cv2.WINDOW_NORMAL)
-            # # cv2.resizeWindow("Demo", 1280, 1280)
-            # # cv2.imshow("Demo", img)
-            # # cv2.waitKey(0)  # 等待用户按键触发
-            # cv2.imwrite(str(self.save_count) + ".png", img)
-            # self.save_count += 1
+        # if self.save_count <= 200
+        # 可视化
+        # classesname = ['battery', 'pressure', 'umbrella', 'OCbottle', 'glassbottle', 'lighter', 'electronicequipment',
+        #                'knife', 'metalbottle']
+        # for label, label1 in zip(gt_bboxes, gt_bboxes_labels):
+        #     x_min = int(label.tensor.numpy()[0][0])
+        #     y_min = int(label.tensor.numpy()[0][1])
+        #     x_max = int(label.tensor.numpy()[0][2])
+        #     y_max = int(label.tensor.numpy()[0][3])
+        #     name = int(label1)
+        #
+        #     cv2.rectangle(img, (x_min, y_min), (x_max, y_max), (0, 0, 0), 2)
+        #     cv2.putText(img, str(classesname[name]), (x_min, y_min), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
+        #
+        # for label, label1 in zip(draw_gt_bboxes, draw_gt_bboxes_labels):
+        #     x_min = int(label.tensor.numpy()[0][0])
+        #     y_min = int(label.tensor.numpy()[0][1])
+        #     x_max = int(label.tensor.numpy()[0][2])
+        #     y_max = int(label.tensor.numpy()[0][3])
+        #     name = int(label1)
+        #
+        #     cv2.rectangle(img, (x_min, y_min), (x_max, y_max), (0, 0, 255), 2)
+        #     cv2.putText(img, str(classesname[name]), (x_min, y_min), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+        #
+        # # cv2.namedWindow("Demo", cv2.WINDOW_NORMAL)
+        # # cv2.resizeWindow("Demo", 1280, 1280)
+        # # cv2.imshow("Demo", img)
+        # # cv2.waitKey(0)  # 等待用户按键触发
+        # cv2.imwrite(str(self.save_count) + ".png", img)
+        # self.save_count += 1
 
-            results['img'] = img
-            results['gt_bboxes'] = gt_bboxes
-            results['gt_bboxes_labels'] = gt_bboxes_labels
-            results['gt_ignore_flags'] = np.zeros_like(gt_bboxes_labels)
+        results['img'] = img
+        results['gt_bboxes'] = gt_bboxes
+        results['gt_bboxes_labels'] = gt_bboxes_labels
+        results['gt_ignore_flags'] = np.zeros_like(gt_bboxes_labels)
 
-            if len(self.cache_list) > self.cache_num:
-                # 从大到小删除
-                index1 = sorted(random.sample(range(len(self.cache_list)), k=len(self.cache_list)-self.cache_num),
-                                reverse=True)
-                for index_del in index1:
-                    self.cache_list.pop(index_del)
-            if flag:
-                results['dataset'] = dataset
+        if len(self.cache_list) > self.cache_num:
+            # 从大到小删除
+            index1 = sorted(random.sample(range(len(self.cache_list)), k=len(self.cache_list)-self.cache_num),
+                            reverse=True)
+            for index_del in index1:
+                self.cache_list.pop(index_del)
+        if flag:
+            results['dataset'] = dataset
 
-            return results
-        except Exception as e:
-            print(e)
-            return results
+        return results
+        # except Exception as e:
+        #     print('error', e)
+        #     return results
 
     def get_keep_indexes(self,
                     gt_bbox: HorizontalBoxes,
@@ -2672,3 +2686,63 @@ class CopyPasteIJCAI1(BaseTransform):
         return (overlap / (area_gt_bbox + eps)) > 0.6
 
 
+@TRANSFORMS.register_module()
+class RandomRotateYOLO(BaseTransform):
+
+    def __init__(self):
+        pass
+
+    def transform(self, results):
+        num = random.random()
+        img = results['img']
+        img_shape = img.shape
+        gt_bboxes = results['gt_bboxes']
+        # assert img_shape[0] == img_shape[1]
+        # 不旋转
+        if num < 0.25:
+            return results
+        elif num < 0.5:
+            # 逆时针旋转90度
+            new_img = np.rot90(img, k=1)
+            h, w = new_img.shape[:2]
+            # bboxes 变换
+            # 逆时针旋转90度，新的x1 = 旧y1
+            # 新的y1 =
+            gt_bboxes_tensor = gt_bboxes.tensor
+            x1, y1, x2, y2 = gt_bboxes_tensor.T.split((1, 1, 1, 1))
+            new_gt_bboxes_tensor = torch.cat([
+                y1,
+                h - x2,
+                y2,
+                h - x1
+            ]).T
+        elif num < 0.75:
+            # 逆时针旋转180度
+            new_img = np.rot90(img, k=2)
+            h, w = new_img.shape[:2]
+            gt_bboxes_tensor = gt_bboxes.tensor
+            x1, y1, x2, y2 = gt_bboxes_tensor.T.split((1, 1, 1, 1))
+            new_gt_bboxes_tensor = torch.cat([
+                w - x2,
+                h - y2,
+                w - x1,
+                h - y1
+            ]).T
+        else:
+            # 逆时针旋转270度
+            new_img = np.rot90(img, k=3)
+            h, w = new_img.shape[:2]
+            gt_bboxes_tensor = gt_bboxes.tensor
+            x1, y1, x2, y2 = gt_bboxes_tensor.T.split((1, 1, 1, 1))
+            new_gt_bboxes_tensor = torch.cat([
+                w - y2,
+                x1,
+                w - y1,
+                x2
+            ]).T
+        # print('123', new_gt_bboxes_tensor.shape)
+        new_gt_bboxes = HorizontalBoxes(new_gt_bboxes_tensor, dtype=gt_bboxes_tensor.dtype, device=gt_bboxes.device)
+        results['img'] = new_img
+        results['img_shape'] = new_img.shape[:2]
+        results['gt_bboxes'] = new_gt_bboxes
+        return results

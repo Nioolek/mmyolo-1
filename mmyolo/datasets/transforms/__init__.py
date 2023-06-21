@@ -7,7 +7,7 @@ from .transforms import (FilterAnnotations, LetterResize, LoadAnnotations,
                          RegularizeRotatedBox, RemoveDataElement, Resize,
                          YOLOv5CopyPaste, YOLOv5HSVRandomAug,
                          YOLOv5KeepRatioResize, YOLOv5RandomAffine, CopyPasteIJCAI, RandomCropYOLO, SemiOrgimg2img,
-                         RandomFlipYOLO, CopyPasteIJCAI1)
+                         RandomFlipYOLO, CopyPasteIJCAI1, RandomRotateYOLO)
 
 __all__ = [
     'YOLOv5KeepRatioResize', 'LetterResize', 'Mosaic', 'YOLOXMixUp',
@@ -16,5 +16,6 @@ __all__ = [
     'Mosaic9', 'YOLOv5CopyPaste', 'RemoveDataElement', 'RegularizeRotatedBox',
     'Polygon2Mask', 'PackDetInputs', 'RandomAffine', 'RandomFlip', 'Resize',
     'FilterAnnotations', 'CopyPasteIJCAI', 'RandomCropYOLO',
-    'SemiOrgimg2img', 'RandomFlipYOLO', 'CopyPasteIJCAI1'
+    'SemiOrgimg2img', 'RandomFlipYOLO', 'CopyPasteIJCAI1',
+    'RandomRotateYOLO'
 ]

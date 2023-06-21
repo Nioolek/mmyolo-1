@@ -7,7 +7,7 @@ data_root = 'data/coco/'
 train_ann_file = 'annotations/instances_train2017.json'
 train_data_prefix = 'train2017/'  # Prefix of train image path
 # Path of val annotation file
-val_ann_file = 'annotations/instances_val2017.json'
+val_ann_file = 'annotations/val.json'
 val_data_prefix = 'val2017/'  # Prefix of val image path
 
 num_classes = 80  # Number of classes for classification
