@@ -19,7 +19,7 @@ val_batch_size_per_gpu = 1
 base_lr = 0.004 / 8
 max_epochs = 300  # Maximum training epochs
 
-img_scale = (1408, 1408)  # width, height
+img_scale = (1280, 1280)  # width, height
 
 # Config of batch shapes. Only on val.
 batch_shapes_cfg = dict(
@@ -72,10 +72,7 @@ train_pipeline = [
         use_cached=True,
         max_cached_images=_base_.mosaic_max_cached_images,
         pad_val=114.0),
-    dict(
-        type='CopyPasteIJCAI1',
-        n=(-0.1, 0.6)
-    ),
+    dict(type='CopyPasteIJCAI1', n=(-0.1, 0.6)),
     dict(
         type='mmdet.RandomResize',
         # img_scale is (width, height)

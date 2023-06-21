@@ -44,7 +44,7 @@ model = dict(
 # 再是数据部分
 dataset_type = _base_.dataset_type
 data_root = _base_.data_root
-img_scale = (1408, 1408)  # width, height
+img_scale = (1280, 1280)  # width, height
 batch_size = 2
 semi_batch_size = batch_size
 num_workers = 10
@@ -61,10 +61,7 @@ sup_pipeline = [
         use_cached=True,
         max_cached_images=_base_.mosaic_max_cached_images,
         pad_val=114.0),
-    dict(
-        type='CopyPasteIJCAI1',
-        n=(-0.1, 0.6)
-    ),
+    dict(type='CopyPasteIJCAI1', n=(-0.1, 0.6)),
     dict(
         type='mmdet.RandomResize',
         # img_scale is (width, height)
@@ -101,15 +98,19 @@ sup_pipeline = [
 
 weak_pipeline = [
     dict(type='SemiOrgimg2img'),
-    dict(type='mmdet.PackDetInputs', meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape'))
+    dict(
+        type='mmdet.PackDetInputs',
+        meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape'))
 ]
 
 strong_pipeline = [
     dict(type='RandomFlipYOLO'),
     dict(type='YOLOv5HSVRandomAug'),
     dict(type='mmdet.CutOut', n_holes=(0, 3), cutout_shape=(32, 32)),
-    dict(type='mmdet.PackDetInputs', meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape',
-                                                'flip_state', 'matrix', 'scaleing_affine'))
+    dict(
+        type='mmdet.PackDetInputs',
+        meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape',
+                   'flip_state', 'matrix', 'scaleing_affine'))
 ]
 
 unsup_pipeline = [
@@ -120,11 +121,12 @@ unsup_pipeline = [
         img_scale=img_scale,
         use_cached=True,
         max_cached_images=_base_.mosaic_max_cached_images,
-        pad_val=114.0),     # (3200, 3200)
-    dict(type='RandomCropYOLO', crop_size=img_scale, allow_negative_crop=True),   # (1600, 1600)
+        pad_val=114.0),  # (3200, 3200)
+    dict(type='RandomCropYOLO', crop_size=img_scale,
+         allow_negative_crop=True),  # (1600, 1600)
     dict(type='mmdet.Pad', size=img_scale, pad_val=dict(img=(114, 114, 114))),
     dict(
-        type='YOLOv5RandomAffine',     # ori_img (1600, 1600) img (1600, 1600)
+        type='YOLOv5RandomAffine',  # ori_img (1600, 1600) img (1600, 1600)
         max_rotate_degree=0.0,
         max_shear_degree=0.0,
         scaling_ratio_range=(1 - 0.2, 1 + 0.2),
@@ -170,7 +172,7 @@ unlabeled_dataset = dict(
 
 # 半监督学习的dataloader
 train_dataloader_semi = dict(
-    batch_size=batch_size+semi_batch_size,
+    batch_size=batch_size + semi_batch_size,
     num_workers=num_workers,
     persistent_workers=False,
     sampler=dict(type='SemiMultiSampler', shuffle=True),
@@ -180,8 +182,7 @@ train_dataloader_semi = dict(
         unsup_num=1000,
         start_num=1799,
         sup_batch_size=batch_size,
-        semi_batch_size=semi_batch_size
-    ),
+        semi_batch_size=semi_batch_size),
     # sampler=dict(
     #     type='SemiSampler',
     #     batch_size=batch_size,
@@ -214,9 +215,7 @@ param_scheduler = [
 ]
 
 custom_hooks = [
-    dict(
-        type='EfficientTeacherHook',
-        priority=49),
+    dict(type='EfficientTeacherHook', priority=49),
     dict(
         type='DataloaderSwitchHook',
         switch_epoch=200,
