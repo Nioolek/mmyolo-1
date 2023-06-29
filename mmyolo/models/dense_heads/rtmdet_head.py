@@ -310,14 +310,14 @@ class RTMDetHead(YOLOv5Head):
         self.use_semi_uncertain = use_semi_uncertain
 
         self.certain_threshold = torch.Tensor([
-            0.35,  # 'battery',
+            0.4,  # 'battery',
             0.5,  # 'pressure',
             0.5,  # 'umbrella',
             0.5,  # 'OCbottle',
             0.5,  # 'glassbottle',
-            0.5,  # 'lighter',
+            0.4,  # 'lighter',
             0.5,  # 'electronicequipment',
-            0.35,  # 'knife',
+            0.5,  # 'knife',
             0.5,  # 'metalbottle'
         ]).cuda()
         self.uncertain_threshold = torch.Tensor([

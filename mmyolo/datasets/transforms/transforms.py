@@ -2303,16 +2303,20 @@ class RandomCropYOLO(MMDET_RandomCrop):
                  width_ratio_thre: float = 0.11,
                  height_ratio_thre: float = 0.11,
                  area_ratio_thre: float = 0.08,
+                 show=False,
                  **kwargs) -> None:
         self.width_ratio_thre = width_ratio_thre
         self.height_ratio_thre = height_ratio_thre
         self.area_ratio_thre = area_ratio_thre
+        self.show = show
         super().__init__(*args, **kwargs)
 
     def _crop_data(self, results: dict, crop_size: Tuple[int, int],
                    allow_negative_crop: bool) -> Union[dict, None]:
         assert crop_size[0] > 0 and crop_size[1] > 0
         img = results['img']
+        # if self.show:
+        #     print('crop', results['gt_bboxes'])
         margin_h = max(img.shape[0] - crop_size[0], 0)
         margin_w = max(img.shape[1] - crop_size[1], 0)
         offset_h, offset_w = self._rand_offset((margin_h, margin_w))
@@ -2395,13 +2399,28 @@ class RandomFlipYOLO(BaseTransform):
         # 由于半监督是没有label的，所以不用考虑标签的flip
         # left right flip
         flip_state = [0, 0]
+        gt_bboxes = results['gt_bboxes']
+        if isinstance(gt_bboxes, np.ndarray):
+            results['gt_bboxes'] = HorizontalBoxes(np.zeros((0, 4), dtype=float))
         if random.random() < 0.5:
             results['img'] = mmcv.imflip(results['img'], direction='horizontal')
             flip_state[0] = 1
+            if 'gt_bboxes' in results:
+                gt_bboxes = results['gt_bboxes']
+                if isinstance(gt_bboxes, np.ndarray):
+                    print(gt_bboxes)
+                gt_bboxes.flip_(results['img'].shape[:2])
+                results['gt_bboxes'] = gt_bboxes
 
         if random.random() < 0.5:
             results['img'] = mmcv.imflip(results['img'], direction='vertical')
             flip_state[1] = 1
+            if 'gt_bboxes' in results:
+                gt_bboxes = results['gt_bboxes']
+                if isinstance(gt_bboxes, np.ndarray):
+                    print(gt_bboxes)
+                gt_bboxes.flip_(results['img'].shape[:2], direction='vertical')
+                results['gt_bboxes'] = gt_bboxes
 
         results['flip_state'] = flip_state
 
@@ -2695,54 +2714,66 @@ class RandomRotateYOLO(BaseTransform):
     def transform(self, results):
         num = random.random()
         img = results['img']
-        img_shape = img.shape
-        gt_bboxes = results['gt_bboxes']
+        if 'gt_bboxes' in results:
+            gt_bboxes = results['gt_bboxes']
+            flag = True
+        else:
+            flag = False
         # assert img_shape[0] == img_shape[1]
         # 不旋转
         if num < 0.25:
+            results['rotate'] = np.array([0, ], dtype=int)
             return results
         elif num < 0.5:
             # 逆时针旋转90度
             new_img = np.rot90(img, k=1)
-            h, w = new_img.shape[:2]
-            # bboxes 变换
-            # 逆时针旋转90度，新的x1 = 旧y1
-            # 新的y1 =
-            gt_bboxes_tensor = gt_bboxes.tensor
-            x1, y1, x2, y2 = gt_bboxes_tensor.T.split((1, 1, 1, 1))
-            new_gt_bboxes_tensor = torch.cat([
-                y1,
-                h - x2,
-                y2,
-                h - x1
-            ]).T
+            if flag:
+                h, w = new_img.shape[:2]
+                # bboxes 变换
+                # 逆时针旋转90度，新的x1 = 旧y1
+                # 新的y1 =
+                gt_bboxes_tensor = gt_bboxes.tensor
+                x1, y1, x2, y2 = gt_bboxes_tensor.T.split((1, 1, 1, 1))
+                new_gt_bboxes_tensor = torch.cat([
+                    y1,
+                    h - x2,
+                    y2,
+                    h - x1
+                ]).T
+            results['rotate'] = np.array([1, ], dtype=int)
         elif num < 0.75:
             # 逆时针旋转180度
             new_img = np.rot90(img, k=2)
-            h, w = new_img.shape[:2]
-            gt_bboxes_tensor = gt_bboxes.tensor
-            x1, y1, x2, y2 = gt_bboxes_tensor.T.split((1, 1, 1, 1))
-            new_gt_bboxes_tensor = torch.cat([
-                w - x2,
-                h - y2,
-                w - x1,
-                h - y1
-            ]).T
+            if flag:
+                h, w = new_img.shape[:2]
+                gt_bboxes_tensor = gt_bboxes.tensor
+                x1, y1, x2, y2 = gt_bboxes_tensor.T.split((1, 1, 1, 1))
+                new_gt_bboxes_tensor = torch.cat([
+                    w - x2,
+                    h - y2,
+                    w - x1,
+                    h - y1
+                ]).T
+            results['rotate'] = np.array([2, ], dtype=int)
         else:
             # 逆时针旋转270度
             new_img = np.rot90(img, k=3)
-            h, w = new_img.shape[:2]
-            gt_bboxes_tensor = gt_bboxes.tensor
-            x1, y1, x2, y2 = gt_bboxes_tensor.T.split((1, 1, 1, 1))
-            new_gt_bboxes_tensor = torch.cat([
-                w - y2,
-                x1,
-                w - y1,
-                x2
-            ]).T
+            if flag:
+                h, w = new_img.shape[:2]
+                gt_bboxes_tensor = gt_bboxes.tensor
+                x1, y1, x2, y2 = gt_bboxes_tensor.T.split((1, 1, 1, 1))
+                new_gt_bboxes_tensor = torch.cat([
+                    w - y2,
+                    x1,
+                    w - y1,
+                    x2
+                ]).T
+            results['rotate'] = np.array([3, ], dtype=int)
         # print('123', new_gt_bboxes_tensor.shape)
-        new_gt_bboxes = HorizontalBoxes(new_gt_bboxes_tensor, dtype=gt_bboxes_tensor.dtype, device=gt_bboxes.device)
+        if flag:
+            new_gt_bboxes = HorizontalBoxes(new_gt_bboxes_tensor, dtype=gt_bboxes_tensor.dtype, device=gt_bboxes.device)
+            results['gt_bboxes'] = new_gt_bboxes
         results['img'] = new_img
         results['img_shape'] = new_img.shape[:2]
-        results['gt_bboxes'] = new_gt_bboxes
+
         return results

@@ -29,7 +29,7 @@ from mmyolo.registry import MODELS
 class EfficientTeacher(SemiBaseDetector):
     def __init__(self,
                  detector: ConfigType,
-                 nms_conf_thres=0.1,
+                 nms_conf_thres=0.2,
                  nms_iou_thres=0.65,
                  semi_train_cfg: OptConfigType = None,
                  semi_test_cfg: OptConfigType = None,
@@ -187,17 +187,52 @@ class EfficientTeacher(SemiBaseDetector):
             log_vars = dict()
             sup_log_vars = self.student.loss(multi_batch_inputs['sup'], multi_batch_data_samples['sup'])
 
-
             unsup_teacher_inputs = multi_batch_inputs['unsup_teacher']
             unsup_student_inputs = multi_batch_inputs['unsup_student']
             with torch.no_grad():
                 cls_scores, bbox_preds = self.teacher.module._forward(unsup_teacher_inputs)
+                unsup_student_data_samples = multi_batch_data_samples['unsup_student']
                 pe_results_list = self.create_pseudo_label_online_with_gt(cls_scores, bbox_preds,
                                                                           unsup_teacher_inputs.shape,
-                                                                          multi_batch_data_samples['unsup_student'])
+                                                                          unsup_student_data_samples)
+                # 融合json结果和teacher预测结果
+                for i in range(unsup_teacher_inputs.shape[0]):
+                    student_datasample = unsup_student_data_samples[i]
+                    pse_gt_instances = student_datasample.pse_gt_instances
+                    gt_instances = student_datasample.gt_instances
+                    # print('!!!!!!!!!!!!!!!!!!!!!!!')
+                    # print(student_datasample)
+                    if gt_instances.bboxes.numel() == 0:
+                        student_datasample.gt_instances = pse_gt_instances
+                    else:
+                        merged_bboxes = torch.cat([gt_instances.bboxes.cuda(), pse_gt_instances.bboxes], dim=0)
+                        if merged_bboxes.numel() == 0:
+                            gt_instances.scores = torch.zeros([0,],
+                                                              device=pse_gt_instances.bboxes.device,
+                                                              dtype=pse_gt_instances.bboxes.dtype)
+                            continue
+                        merged_scores = torch.cat([torch.ones_like(gt_instances.labels.cuda(), dtype=torch.float32),
+                                                   pse_gt_instances.scores])
+                        merged_labels = torch.cat([gt_instances.labels.cuda(), pse_gt_instances.labels], dim=0)
+
+                        det_bboxes, keep_idxs = batched_nms(merged_bboxes, merged_scores,
+                                                            merged_labels,
+                                                            {'iou_threshold': 0.75,
+                                                             'type': 'nms'})
+                        det_bboxes = det_bboxes[:300]
+                        det_labels = merged_labels[keep_idxs][:300]
+                        results = InstanceData()
+                        _det_bboxes = det_bboxes.clone()
+                        results.bboxes = _det_bboxes[:, :-1]
+                        results.scores = _det_bboxes[:, -1]
+                        results.labels = det_labels
+                        student_datasample.gt_instances = results
+                    # print(results)
+                # print(unsup_student_data_samples)
+
                 del cls_scores, bbox_preds, unsup_teacher_inputs
 
-            semi_log_vars = self.student.semi_loss(unsup_student_inputs, multi_batch_data_samples['unsup_student'])
+            semi_log_vars = self.student.semi_loss(unsup_student_inputs, unsup_student_data_samples)
             log_vars.update(**sup_log_vars)
             log_vars.update(**semi_log_vars)
 
@@ -356,14 +391,16 @@ class EfficientTeacher(SemiBaseDetector):
         for i in range(n_img):
             student_datasample = student_datasample_list[i]
             flip_state = student_datasample.flip_state
+            rotate = student_datasample.rotate
             scaleing_affine = student_datasample.scaleing_affine
             matrix = student_datasample.matrix
-            img_h, img_w, _ = student_datasample.img_shape
+            img_h, img_w = student_datasample.img_shape[:2]
 
             # 将预测结果从teacher对应到student
             results = results_list[i]
             res_bboxes, res_labels, res_scores = results.bboxes, results.labels, results.scores
             hor_boxes = HorizontalBoxes(res_bboxes).cpu()
+            # random affine
             hor_boxes_org = hor_boxes.clone()
             hor_boxes_org.rescale_([scaleing_affine, scaleing_affine])
             hor_boxes.project_(matrix)
@@ -375,16 +412,57 @@ class EfficientTeacher(SemiBaseDetector):
             res_labels = res_labels[valid_indexes]
             res_scores = res_scores[valid_indexes]
 
+            # 翻转
             if flip_state[0]:
                 hor_boxes.flip_((img_h, img_w), direction='horizontal')
             if flip_state[1]:
                 hor_boxes.flip_((img_h, img_w), direction='vertical')
+            # print(rotate, 'rotate')
+            # 旋转
+            if rotate == 0:
+                pass
+            elif rotate == 1:
+                hor_boxes_tensor = hor_boxes.tensor
+                x1, y1, x2, y2 = hor_boxes_tensor.T.split((1, 1, 1, 1))
+                new_hor_boxes_tensor = torch.cat([
+                    y1,
+                    img_h - x2,
+                    y2,
+                    img_h - x1
+                ]).T
+                hor_boxes = HorizontalBoxes(new_hor_boxes_tensor, dtype=hor_boxes.dtype,
+                                            device=hor_boxes.device)
+                # print('111')
+            elif rotate == 2:
+                hor_boxes_tensor = hor_boxes.tensor
+                x1, y1, x2, y2 = hor_boxes_tensor.T.split((1, 1, 1, 1))
+                new_hor_boxes_tensor = torch.cat([
+                    img_w - x2,
+                    img_h - y2,
+                    img_w - x1,
+                    img_h - y1
+                ]).T
+                hor_boxes = HorizontalBoxes(new_hor_boxes_tensor, dtype=hor_boxes.dtype,
+                                            device=hor_boxes.device)
+                # print('222')
+            else:
+                hor_boxes_tensor = hor_boxes.tensor
+                x1, y1, x2, y2 = hor_boxes_tensor.T.split((1, 1, 1, 1))
+                new_hor_boxes_tensor = torch.cat([
+                    img_w - y2,
+                    x1,
+                    img_w - y1,
+                    x2
+                ]).T
+                hor_boxes = HorizontalBoxes(new_hor_boxes_tensor, dtype=hor_boxes.dtype,
+                                            device=hor_boxes.device)
+                # print('333')
 
             student_instances = InstanceData()
             student_instances.bboxes = hor_boxes.tensor.cuda()
             student_instances.labels = res_labels.cuda()
             student_instances.scores = res_scores.cuda()
-            student_datasample.gt_instances = student_instances
+            student_datasample.pse_gt_instances = student_instances
         return results_list
 
 
@@ -443,12 +521,13 @@ class EfficientTeacher(SemiBaseDetector):
 
 @HOOKS.register_module()
 class EfficientTeacherHook(Hook):
-    def __init__(self):
-        self.ema_cfg = dict(
-            ema_type='ExpMomentumEMA',
-            momentum=0.0002,
-            update_buffers=True,
-        )
+    def __init__(self,
+                 ema_cfg=dict(
+                     ema_type='ExpMomentumEMA',
+                     momentum=0.0002,
+                     update_buffers=True)
+                 ):
+        self.ema_cfg = ema_cfg
         self.copy_para = False
 
     def before_run(self, runner: Runner) -> None:
